@@ -1,0 +1,63 @@
+name: build-patched
+
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+      - name: dev packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential pkg-config libx11-dev libcairo2-dev libpango1.0-dev libgdk-pixbuf-2.0-dev libglib2.0-dev libssl-dev python3
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - name: apply Linux patches
+        run: python3 tools/sumatra-patches/apply_patches.py --root . --apply
+      - name: Release build
+        run: bun cmd/ng-build.ts -rel SumatraPDF
+      - name: normalize ISA property
+        run: |
+          python3 - <<'PY'
+          import pathlib
+          import subprocess
+
+          binary = pathlib.Path("out/linux/rel/SumatraPDF")
+          note = pathlib.Path("isa.property")
+          subprocess.run(
+              ["objcopy", "--dump-section", f".note.gnu.property={note}", str(binary)],
+              check=True,
+          )
+          data = bytearray(note.read_bytes())
+          needle = bytes.fromhex("028000c004000000")
+          pos = data.find(needle)
+          if pos < 0:
+              raise SystemExit("x86 ISA needed property not found")
+          pos += len(needle)
+          old = int.from_bytes(data[pos : pos + 4], "little")
+          if old != 1:
+              data[pos : pos + 4] = (1).to_bytes(4, "little")
+              note.write_bytes(data)
+              subprocess.run(
+                  ["objcopy", "--update-section", f".note.gnu.property={note}", str(binary)],
+                  check=True,
+              )
+          print(f"x86 ISA needed: {old:#x} -> 0x1")
+          PY
+      - name: verify ISA
+        run: |
+          readelf -n out/linux/rel/SumatraPDF | tee isa.txt
+          grep -q 'x86 ISA needed: x86-64-baseline$' isa.txt || {
+            echo 'ERROR: binary still requires a newer x86 ISA' >&2
+            exit 1
+          }
+      - name: Upload patched binary
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: ng-linux-patched
+          path: out/linux/rel/SumatraPDF
+          if-no-files-found: error
+          retention-days: 7
